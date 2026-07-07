@@ -1,0 +1,32 @@
+# core
+numpy
+faiss-cpu
+
+# pdf (faiss_store.py)
+pymupdf
+easyocr
+pillow
+sentence-transformers
+
+# document extractors
+openpyxl
+python-docx
+python-pptx
+
+# NER
+spacy
+gliner
+
+# LLM (Vertex / Gemini)
+google-cloud-aiplatform
+google-generativeai
+
+# graph
+neo4j
+pyvis
+
+# app
+streamlit
+
+# utils
+python-dotenv
