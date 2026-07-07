@@ -1,2 +1,4 @@
 .env
 vertex_key.json
+__pycache__/
+.DS_Store
