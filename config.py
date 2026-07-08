@@ -25,6 +25,12 @@ CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_MODEL_RELATIONS = os.environ.get("CLAUDE_MODEL_RELATIONS", "claude-sonnet-5")
 CLAUDE_MODEL_LIGHT = os.environ.get("CLAUDE_MODEL_LIGHT", "claude-haiku-4-5-20251001")
 
+# ── SMART EXTRACTION — the actual rate-limit fix ────────────────────────────
+SMART_EXTRACTION = os.environ.get("SMART_EXTRACTION", "true").lower() == "true"
+LOCAL_TEXT_SUFFICIENCY_THRESHOLD = int(os.environ.get("LOCAL_TEXT_SUFFICIENCY_THRESHOLD", "400"))
+EXTRACTION_CACHE_DIR = PROJECT_ROOT / "logs" / "extraction_cache"
+EXTRACTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # ── VERTEX / GEMINI (same pattern as faiss_store._get_gemini_client) ─────
 VERTEX_KEY_PATH  = PROJECT_ROOT / "vertex_key.json"
 GOOGLE_CLOUD_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT", "")

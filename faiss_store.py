@@ -1,12 +1,52 @@
+"""
+faiss_store.py  — v3.0
+======================
+Extraction pipeline (PRIMARY: Claude vision via Anthropic API, FALLBACK: local):
+
+SMART EXTRACTION (default on):
+  For each page, run the local 4-pass pipeline FIRST (fast, free). Only
+  escalate to Claude vision if the page's local text is sparse, or the page
+  has embedded images, or PyMuPDF detects a table — i.e. any signal that the
+  local pass might have missed something. This is what keeps a large corpus
+  rebuild from blowing through Claude's rate limits: most clean prose pages
+  never touch the API at all.
+
+  Escalation ladder per page:
+    1. Local 4-pass pipeline (always runs first, free)
+    2. If flagged -> Claude Haiku vision (cheap, high-throughput)
+    3. If Haiku output is missing/too-short -> retry once on Claude Sonnet
+    4. If both fail -> local pipeline output is used as-is (already have it)
+
+  Set SMART_EXTRACTION=false in .env to force vision on every page instead
+  (closer to the old "always call the vision model" behavior, higher cost).
+
+FALLBACK (local 4-pass pipeline, unchanged from earlier versions):
+  1. PyMuPDF  text blocks  →  prose paragraphs (fast, lossless)
+  2. PyMuPDF  table finder →  markdown-formatted tables
+  3. PyMuPDF  image list   →  EasyOCR on each embedded image
+  4. Full-page OCR fallback when total chars < OCR_THRESHOLD
+
+Chunking — SENTENCE-BOUNDARY AWARE:
+  Parent : ~1200 chars  (what the LLM reads as context)
+  Child  : ~250  chars  (what gets embedded and searched)
+  Both splits respect sentence boundaries — no abrupt mid-sentence cuts.
+
+Per-page extraction is cached to disk (logs/extraction_cache/) keyed on
+file content hash, so an interrupted or re-run build never re-bills pages
+that were already successfully extracted.
+
+workers=0 in EasyOCR disables the DataLoader worker *processes* that
+cause the macOS ARM (M1/M2/M3) segfault. OCR quality unaffected.
+"""
+
 from __future__ import annotations
 
-import base64
 import gc
+import hashlib
 import json
 import os
 import pickle
 import re
-import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +56,10 @@ import numpy as np
 os.environ.setdefault("OMP_NUM_THREADS",        "1")
 os.environ.setdefault("MKL_NUM_THREADS",        "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import config
+from claude_vision_client import extract_from_image
+from extraction_prompts import PDF_PAGE_PROMPT
 
 _easyocr_reader = None
 _embedder       = None
@@ -39,50 +83,9 @@ CHILD_CHUNK_OVERLAP  = 50
 
 OCR_THRESHOLD = 150
 
-# Gemini extraction settings
-GEMINI_PAGE_DPI      = 150   # render resolution for Gemini (balance quality/tokens)
-GEMINI_RETRY_DELAY   = 5     # seconds between retries on rate-limit
-GEMINI_MAX_RETRIES   = 3
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GEMINI EXTRACTION PROMPT
-# ─────────────────────────────────────────────────────────────────────────────
-_GEMINI_PAGE_PROMPT = """You are extracting ALL content from a page of an SBI Life insurance product brochure.
-
-Your output will be used to build a semantic search index. Extract EVERYTHING on the page.
-
-EXTRACTION RULES:
-1. PROSE TEXT: Extract all body text in natural reading order (top-to-bottom, left-to-right).
-   Preserve paragraph breaks with a blank line. Do NOT omit any sentence.
-
-2. TABLES: Convert every table to GitHub-flavoured markdown (| col1 | col2 | format).
-   Include ALL rows and ALL columns. Never truncate a table.
-   If a table spans the full page, that's fine — output the complete table.
-
-3. IMAGES / CHARTS / ILLUSTRATIONS:
-   - For benefit illustration tables embedded as images: extract every number, label, and column.
-   - For graphs: describe axes, all data points, and any legends.
-   - For diagrams (e.g., policy flow diagrams): describe each step/box and arrows.
-   - For icons with labels: output "Icon: <label>".
-
-4. HEADERS / FOOTERS: Include page headers/footers verbatim (they often contain product name,
-   UIN number, disclaimer text). Mark them as [HEADER] and [FOOTER].
-
-5. BOLD / HIGHLIGHTED TEXT: Preserve emphasis by wrapping in **double asterisks**.
-
-6. NUMBERS AND PERCENTAGES: Never paraphrase or round. Output exact values as shown.
-
-7. DISCLAIMERS / FINE PRINT: Extract completely, even if very small font.
-
-OUTPUT FORMAT:
-- Plain text with markdown tables.
-- Section the output by content type if helpful (e.g., start tables with a blank line).
-- Do NOT add commentary, summaries, or your own words.
-- Do NOT say "This page contains..." or "I can see...".
-- Output ONLY the extracted content.
-
-Extract everything from the insurance brochure page shown:"""
+# Claude vision extraction settings (see claude_vision_client.py for the
+# actual API calls, retry/backoff, and shared rate limiter)
+CLAUDE_PAGE_DPI = 150   # render resolution for vision calls (balance quality/tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,6 +97,10 @@ def _slugify(name: str) -> str:
     name = unicodedata.normalize("NFKD", name)
     name = re.sub(r"[^\w\s-]", "", name).strip().lower()
     return re.sub(r"[\s-]+", "_", name)
+
+
+def _file_hash(path: str) -> str:
+    return hashlib.md5(Path(path).read_bytes()).hexdigest()[:10]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,97 +131,10 @@ def _get_ocr_reader():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEMINI CLIENT — tries Vertex AI first, then Gemini Direct API
+# PRIMARY EXTRACTION — Claude vision per page (smart-gated)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_gemini_client():
-    """
-    Returns a callable: fn(image_bytes: bytes) -> str
-    Tries Vertex AI (google-cloud-aiplatform) first.
-    Falls back to google-generativeai (Gemini Direct API).
-    Returns None if neither is available.
-    """
-    # ── Try Vertex AI ─────────────────────────────────────────────────────────
-    _vertex_key_path = PROJECT_ROOT / "vertex_key.json"
-    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and _vertex_key_path.exists():
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_vertex_key_path)
-
-    # Auto-extract project_id from key file if env var not set
-    if not os.environ.get("GOOGLE_CLOUD_PROJECT") and _vertex_key_path.exists():
-        try:
-            import json as _json
-            _key_data = _json.loads(_vertex_key_path.read_text())
-            os.environ["GOOGLE_CLOUD_PROJECT"] = _key_data.get("project_id", "")
-        except Exception:
-            pass
-
-    vertex_project  = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    vertex_location = os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
-    vertex_creds    = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    vertex_model    = os.environ.get("VERTEX_MODEL_ID", "gemini-2.5-pro")
-
-    if vertex_project and (vertex_creds or os.path.exists("./vertex_key.json")):
-        try:
-            import vertexai
-            from vertexai.generative_models import GenerativeModel, Part, Image as VImage
-
-            if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and \
-               os.path.exists("./vertex_key.json"):
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "./vertex_key.json"
-
-            vertexai.init(project=vertex_project, location=vertex_location)
-            model = GenerativeModel(vertex_model)
-
-            def vertex_fn(image_bytes: bytes, prompt: str = _GEMINI_PAGE_PROMPT) -> str:
-                img_part = Part.from_data(data=image_bytes, mime_type="image/png")
-                response = model.generate_content(
-                    [img_part, prompt],
-                    generation_config={"temperature": 0.1, "max_output_tokens": 8192},
-                )
-                return response.text or ""
-
-            print(f"  [gemini] Using Vertex AI ({vertex_project} / {vertex_model})", flush=True)
-            return vertex_fn
-
-        except Exception as e:
-            print(f"  [gemini] Vertex AI init failed: {e} — trying Gemini Direct…", flush=True)
-
-    # ── Try Gemini Direct API ─────────────────────────────────────────────────
-    gemini_key   = os.environ.get("GEMINI_API_KEY", "")
-    gemini_model = os.environ.get("GEMINI_MODEL_ID", "gemini-2.5-pro")
-
-    if gemini_key:
-        try:
-            import google.generativeai as genai
-            from google.generativeai.types import HarmCategory, HarmBlockThreshold
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(gemini_model)
-
-            def gemini_direct_fn(image_bytes: bytes, prompt: str = _GEMINI_PAGE_PROMPT) -> str:
-                import PIL.Image
-                import io
-                img = PIL.Image.open(io.BytesIO(image_bytes))
-                response = model.generate_content(
-                    [prompt, img],
-                    generation_config={"temperature": 0.1, "max_output_tokens": 8192},
-                )
-                return response.text or ""
-
-            print(f"  [gemini] Using Gemini Direct API ({gemini_model})", flush=True)
-            return gemini_direct_fn
-
-        except Exception as e:
-            print(f"  [gemini] Gemini Direct init failed: {e}", flush=True)
-
-    print("  [gemini] No Gemini client available — will use local fallback.", flush=True)
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PRIMARY EXTRACTION — Gemini multimodal per page
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _page_to_png_bytes(page, dpi: int = GEMINI_PAGE_DPI) -> bytes:
+def _page_to_png_bytes(page, dpi: int = CLAUDE_PAGE_DPI) -> bytes:
     """Render a PyMuPDF page to PNG bytes at given DPI."""
     import fitz
     mat = fitz.Matrix(dpi / 72, dpi / 72)
@@ -222,46 +142,61 @@ def _page_to_png_bytes(page, dpi: int = GEMINI_PAGE_DPI) -> bytes:
     return pix.tobytes("png")
 
 
-def extract_page_with_gemini(
-    page,
-    gemini_fn,
-    page_num: int,
-    verbose: bool = True,
-) -> Optional[str]:
+def _page_needs_vision(page, local_text: str) -> bool:
     """
-    Send one page image to Gemini. Returns extracted text or None on failure.
-    Includes retry logic for rate-limit errors (429).
+    Decides whether a page needs Claude vision on top of the local pass.
+    Deliberately conservative — any signal that local extraction might be
+    incomplete triggers escalation, since a missed chart/table is worse
+    than one extra API call.
+
+    Escalates if:
+      - local text is sparse (likely scanned or image-heavy page)
+      - the page has ANY embedded image (could be a chart/benefit table)
+      - PyMuPDF detects ANY table (verify it was captured cleanly)
     """
-    for attempt in range(GEMINI_MAX_RETRIES):
-        try:
-            img_bytes = _page_to_png_bytes(page)
-            text      = gemini_fn(img_bytes, _GEMINI_PAGE_PROMPT)
-            text      = text.strip()
-            if len(text) > 30:   # sanity: at least some content
-                return text
-            if verbose:
-                print(f"    [gemini] page {page_num}: suspiciously short ({len(text)} chars), "
-                      f"retrying…", flush=True)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "429" in err_str or "quota" in err_str or "resource exhausted" in err_str:
-                wait = GEMINI_RETRY_DELAY * (2 ** attempt)
-                if verbose:
-                    print(f"    [gemini] page {page_num}: rate-limited, "
-                          f"waiting {wait}s…", flush=True)
-                time.sleep(wait)
-            else:
-                if verbose:
-                    print(f"    [gemini] page {page_num} attempt {attempt+1} failed: {e}",
-                          flush=True)
-                if attempt == GEMINI_MAX_RETRIES - 1:
-                    return None
-        time.sleep(1.0)   # polite inter-call gap
+    if len(local_text.strip()) < config.LOCAL_TEXT_SUFFICIENCY_THRESHOLD:
+        return True
+    try:
+        if len(page.get_images(full=True)) >= 1:
+            return True
+    except Exception:
+        return True  # can't verify -> don't risk it, escalate
+    try:
+        tabs = page.find_tables()
+        if tabs and tabs.tables:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def extract_page_with_claude(page, page_num: int, verbose: bool = True) -> Optional[str]:
+    """
+    Send one page image to Claude. Tries Haiku first (cheap, fast); if the
+    result is missing or suspiciously short, retries once on Sonnet before
+    giving up — catches pages Haiku genuinely struggles with (dense tables,
+    messy layouts) without paying Sonnet's cost on every page.
+    """
+    img_bytes = _page_to_png_bytes(page)
+
+    text = extract_from_image(img_bytes, PDF_PAGE_PROMPT, model=config.CLAUDE_VISION_MODEL)
+    if text and len(text.strip()) > 30:
+        return text.strip()
+
+    if verbose:
+        print(f"    [claude-vision] page {page_num}: Haiku output too short, "
+              f"retrying on {config.CLAUDE_MODEL_RELATIONS}…", flush=True)
+    text = extract_from_image(img_bytes, PDF_PAGE_PROMPT, model=config.CLAUDE_MODEL_RELATIONS)
+    if text and len(text.strip()) > 30:
+        return text.strip()
+
+    if verbose:
+        print(f"    [claude-vision] page {page_num}: both models failed/too short.", flush=True)
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FALLBACK EXTRACTION — local 4-pass pipeline (unchanged from v1.3)
+# FALLBACK EXTRACTION — local 4-pass pipeline (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_prose(page) -> str:
@@ -344,7 +279,7 @@ def _full_page_ocr(page, dpi: int = 150) -> str:
 
 def _extract_page_local(page, page_num: int, verbose: bool = True,
                          ocr_threshold: int = OCR_THRESHOLD) -> str:
-    """Local 4-pass fallback extraction for one page."""
+    """Local 4-pass fallback/primary-first-pass extraction for one page."""
     parts:   List[str] = []
     methods: List[str] = []
 
@@ -385,69 +320,104 @@ def _extract_page_local(page, page_num: int, verbose: bool = True,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ORCHESTRATOR — Gemini primary, local fallback
+# ORCHESTRATOR — local-first, Claude vision on demand, disk-cached per page
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_pdf_text_full(
     pdf_path: str,
     ocr_threshold: int = OCR_THRESHOLD,
     verbose: bool = True,
-    use_gemini: bool = True,
+    use_gemini: bool = None,   # deprecated alias — old callers still work
+    use_vision: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Extract all text from a PDF.
-    Primary: Gemini-2.5-pro multimodal (if configured).
-    Fallback: local 4-pass pipeline.
+
+    Smart mode (config.SMART_EXTRACTION, default True):
+      local pass runs first on every page; Claude vision is only called on
+      pages _page_needs_vision() flags as risky. Big reduction in API calls
+      on text-heavy corpora, without unconditionally skipping vision.
+
+    Non-smart mode (config.SMART_EXTRACTION=false):
+      every page goes to Claude vision first, local pipeline as fallback —
+      matches the old "always call the vision model" behavior.
 
     Returns list of page dicts:
       {page_num, text, source, extraction_method}
     """
     import fitz
 
+    if use_gemini is not None:
+        use_vision = use_gemini  # backward-compat: old call sites pass use_gemini=...
+
     pages_data  = []
     doc         = fitz.open(pdf_path)
     source_name = Path(pdf_path).name
     total_pages = doc.page_count
 
-    # Try to get Gemini client
-    gemini_fn = _get_gemini_client() if use_gemini else None
+    # ── per-page disk cache, keyed on file content hash ─────────────────────
+    pdf_hash   = _file_hash(pdf_path)
+    cache_path = config.EXTRACTION_CACHE_DIR / f"{_slugify(pdf_path)}_{pdf_hash}.json"
+    cache: Dict[str, Any] = json.loads(cache_path.read_text()) if cache_path.exists() else {}
 
-    if gemini_fn:
-        print(f"  [extract] Using Gemini multimodal for '{source_name}' "
-              f"({total_pages} pages)…", flush=True)
-    else:
-        print(f"  [extract] Using local pipeline for '{source_name}' "
-              f"({total_pages} pages)…", flush=True)
+    def _save_cache():
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False))
+
+    if verbose:
+        mode = "smart (local-first, vision on demand)" if config.SMART_EXTRACTION else "vision-first (every page)"
+        print(f"  [extract] '{source_name}' ({total_pages} pages) — {mode}", flush=True)
 
     for page_num, page in enumerate(doc, start=1):
+        cache_key = str(page_num)
+        if cache_key in cache:
+            pages_data.append(cache[cache_key])
+            continue
+
         text   = ""
         method = "unknown"
 
-        # ── Primary: Gemini ───────────────────────────────────────────────────
-        if gemini_fn:
-            gemini_text = extract_page_with_gemini(
-                page, gemini_fn, page_num, verbose=verbose)
-            if gemini_text and len(gemini_text) > 50:
-                text   = gemini_text
-                method = "gemini"
-            else:
-                if verbose:
-                    print(f"    [gemini] page {page_num}: falling back to local…", flush=True)
+        if config.SMART_EXTRACTION:
+            # ── local pass first ─────────────────────────────────────────
+            local_text = _extract_page_local(page, page_num, verbose=False,
+                                              ocr_threshold=ocr_threshold)
+            text, method = local_text, "local_fast"
 
-        # ── Fallback: local pipeline ──────────────────────────────────────────
-        if not text:
-            text   = _extract_page_local(page, page_num, verbose=verbose,
-                                          ocr_threshold=ocr_threshold)
-            method = "local_fallback"
+            escalate = use_vision and _page_needs_vision(page, local_text)
+            if escalate:
+                claude_text = extract_page_with_claude(page, page_num, verbose=verbose)
+                if claude_text and len(claude_text) > 50:
+                    text, method = claude_text, "claude_vision"
+                elif not text:
+                    # local pass produced nothing AND vision failed — last resort
+                    text = _extract_page_local(page, page_num, verbose=verbose,
+                                                ocr_threshold=ocr_threshold)
+                    method = "local_fallback"
+
+        else:
+            # ── old behavior: vision first, unconditionally ────────────────
+            if use_vision:
+                claude_text = extract_page_with_claude(page, page_num, verbose=verbose)
+                if claude_text and len(claude_text) > 50:
+                    text, method = claude_text, "claude_vision"
+                else:
+                    if verbose:
+                        print(f"    [claude-vision] page {page_num}: falling back to local…", flush=True)
+            if not text:
+                text   = _extract_page_local(page, page_num, verbose=verbose,
+                                              ocr_threshold=ocr_threshold)
+                method = "local_fallback"
 
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if text:
-            pages_data.append({
+            row = {
                 "page_num":          page_num,
                 "text":              text,
                 "source":            source_name,
                 "extraction_method": method,
-            })
+            }
+            pages_data.append(row)
+            cache[cache_key] = row
+            _save_cache()
 
         if verbose and page_num % 5 == 0:
             print(f"    … {page_num}/{total_pages} pages processed", flush=True)
@@ -633,9 +603,13 @@ def build_faiss_index_for_pdf(
     pdf_path: str,
     force_rebuild: bool = False,
     verbose: bool = True,
-    use_gemini: bool = True,
+    use_gemini: bool = None,   # deprecated alias — old callers still work
+    use_vision: bool = True,
 ) -> str:
     import faiss
+
+    if use_gemini is not None:
+        use_vision = use_gemini
 
     slug      = _slugify(pdf_path)
     index_dir = INDEXES_DIR / slug
@@ -653,18 +627,18 @@ def build_faiss_index_for_pdf(
     product_name = Path(pdf_path).stem
 
     if verbose:
-        print(f"  Extracting text (use_gemini={use_gemini})…", flush=True)
+        print(f"  Extracting text (use_vision={use_vision})…", flush=True)
 
     pages_data  = extract_pdf_text_full(
-        pdf_path, verbose=verbose, use_gemini=use_gemini)
+        pdf_path, verbose=verbose, use_vision=use_vision)
     total_chars = sum(len(p["text"]) for p in pages_data)
     methods_used = set(p["extraction_method"] for p in pages_data)
-    gemini_pages = sum(1 for p in pages_data if p["extraction_method"] == "gemini")
-    local_pages  = len(pages_data) - gemini_pages
+    vision_pages = sum(1 for p in pages_data if p["extraction_method"] == "claude_vision")
+    local_pages  = len(pages_data) - vision_pages
 
     if verbose:
         print(f"  {len(pages_data)} pages · {total_chars:,} chars", flush=True)
-        print(f"  Methods: gemini={gemini_pages} local_fallback={local_pages}", flush=True)
+        print(f"  Methods: claude_vision={vision_pages} local={local_pages}", flush=True)
 
     parents, children = build_parent_child_chunks(pages_data, product_name)
     if verbose:
@@ -695,7 +669,7 @@ def build_faiss_index_for_pdf(
         "num_children":  len(children),
         "embed_dim":     dim,
         "methods_used":  list(methods_used),
-        "gemini_pages":  gemini_pages,
+        "claude_vision_pages": vision_pages,
         "local_pages":   local_pages,
         "model":         "paraphrase-multilingual-MiniLM-L12-v2",
     }
@@ -814,9 +788,13 @@ def get_store_for_product(product_name: str) -> Optional[BrochureFAISSStore]:
 def build_user_upload_index(
     pdf_paths: List[str],
     append: bool = False,
-    use_gemini: bool = True,
+    use_gemini: bool = None,   # deprecated alias — old callers still work
+    use_vision: bool = True,
 ) -> BrochureFAISSStore:
     import faiss
+
+    if use_gemini is not None:
+        use_vision = use_gemini
 
     slug      = USER_UPLOAD_SLUG
     index_dir = INDEXES_DIR / slug
@@ -842,7 +820,7 @@ def build_user_upload_index(
     for pdf_path in pdf_paths:
         product_name      = Path(pdf_path).stem
         pages_data        = extract_pdf_text_full(
-            pdf_path, verbose=False, use_gemini=use_gemini)
+            pdf_path, verbose=False, use_vision=use_vision)
         parents, children = build_parent_child_chunks(pages_data, product_name)
         id_map: Dict[str, str] = {}
 
