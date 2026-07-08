@@ -13,6 +13,26 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+from claude_vision_client import extract_from_image
+from extraction_prompts import DOCX_IMAGE_PROMPT, PPTX_SLIDE_IMAGE_PROMPT
+import config
+
+def _describe_docx_images(doc, use_vision: bool = True) -> str:
+    if not use_vision:
+        return ""
+    parts = []
+    for rel in doc.part.rels.values():
+        if "image" not in rel.reltype:
+            continue
+        try:
+            img_bytes = rel.target_part.blob
+            desc = extract_from_image(img_bytes, DOCX_IMAGE_PROMPT, model=config.CLAUDE_VISION_MODEL)
+            if desc:
+                parts.append(f"[Image description]\n{desc}")
+        except Exception:
+            continue
+    return "\n\n".join(parts)
+
 
 def extract_xlsx_text_full(path: str) -> List[Dict[str, Any]]:
     """Each sheet -> one 'page'. Rows rendered as markdown tables."""
